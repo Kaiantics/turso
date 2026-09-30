@@ -3485,6 +3485,22 @@ mod tests {
     }
 
     #[test]
+    pub fn test_schema_refresh_drops_removed_generated_column() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE core (id STRING PRIMARY KEY, sort TEXT, search TEXT AS (CAST (sort AS TEXT)))",
+                "INSERT INTO core (id, sort) VALUES ('a', 'Hello')",
+            ],
+            vec![table_refresh(
+                "CREATE TABLE core (id STRING PRIMARY KEY, sort TEXT)",
+            )],
+            "SELECT * FROM core",
+        )
+        .unwrap();
+        assert_eq!(rows, vec![vec![text("a"), text("Hello")]]);
+    }
+
+    #[test]
     pub fn test_add_column_replay_skips_existing_generated_column() {
         let rows = replay_on_table_with_generated_columns(
             &[
