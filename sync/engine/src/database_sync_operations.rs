@@ -1252,7 +1252,9 @@ fn append_schema_ops(
     deltas: BTreeMap<i64, SchemaRowDelta>,
     ops: &mut Vec<LogicalOp>,
 ) -> Result<()> {
-    for delta in deltas.into_values() {
+    let (drops, other_deltas): (Vec<_>, Vec<_>) =
+        deltas.into_values().partition(|delta| delta.new.is_none());
+    for delta in drops.into_iter().chain(other_deltas) {
         match (delta.old, delta.new) {
             (Some(old), Some(new)) => {
                 if is_logically_replayable_table(&old.name) {
@@ -5471,6 +5473,53 @@ mod tests {
                 turso_core::Value::from_i64(2),
                 turso_core::Value::Text(turso_core::types::Text::new("remote".to_string())),
             ]]
+        );
+    }
+
+    #[test]
+    fn schema_ops_put_drops_before_refreshes() {
+        let schema_row = |row_type: &str, name: &str, sql: &str| super::DecodedSchemaRow {
+            row_type: row_type.to_string(),
+            name: name.to_string(),
+            sql: sql.to_string(),
+        };
+        let mut deltas = BTreeMap::new();
+        deltas.insert(
+            2,
+            super::SchemaRowDelta {
+                old: Some(schema_row(
+                    "table",
+                    "t",
+                    "CREATE TABLE t (id TEXT PRIMARY KEY, a TEXT, b TEXT)",
+                )),
+                new: Some(schema_row(
+                    "table",
+                    "t",
+                    "CREATE TABLE t (id TEXT PRIMARY KEY, b TEXT)",
+                )),
+            },
+        );
+        deltas.insert(
+            3,
+            super::SchemaRowDelta {
+                old: Some(schema_row("index", "t_a", "CREATE INDEX t_a ON t (a)")),
+                new: None,
+            },
+        );
+
+        let mut ops = Vec::new();
+        super::append_schema_ops(deltas, &mut ops).unwrap();
+
+        let actions = ops
+            .iter()
+            .map(|op| (op.schema_action, op.schema_name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec![
+                (Some(LogicalSchemaAction::Drop as i32), "t_a"),
+                (Some(LogicalSchemaAction::Refresh as i32), "t"),
+            ]
         );
     }
 
