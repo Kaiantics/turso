@@ -25,6 +25,7 @@ pub struct ReplayInfo {
     pub pk_column_indices: Option<Vec<usize>>,
     pub rowid_alias_pk_column_index: Option<usize>,
     pub column_names: Vec<String>,
+    pub updates_column_indices: Vec<Option<usize>>,
     pub is_ddl_replay: bool,
 }
 
@@ -151,8 +152,11 @@ impl DatabaseReplayGenerator {
             if !updated {
                 continue;
             }
+            let Some(Some(column_index)) = info.updates_column_indices.get(i) else {
+                continue;
+            };
             row.insert(
-                info.column_names[i].clone(),
+                info.column_names[*column_index].clone(),
                 updates[columns_cnt + i].clone(),
             );
         }
@@ -213,6 +217,9 @@ impl DatabaseReplayGenerator {
                     if !changed {
                         continue;
                     }
+                    let Some(Some(_)) = info.updates_column_indices.get(i) else {
+                        continue;
+                    };
                     let value =
                         std::mem::replace(&mut updates[i + columns_cnt], turso_core::Value::Null);
                     values.push(value);
@@ -369,6 +376,7 @@ impl DatabaseReplayGenerator {
                         pk_column_indices: None,
                         rowid_alias_pk_column_index: None,
                         column_names: Vec::new(),
+                        updates_column_indices: Vec::new(),
                         is_ddl_replay: true,
                     };
                     Ok(delete)
@@ -387,6 +395,7 @@ impl DatabaseReplayGenerator {
                         pk_column_indices: None,
                         rowid_alias_pk_column_index: None,
                         column_names: Vec::new(),
+                        updates_column_indices: Vec::new(),
                         is_ddl_replay: true,
                     };
                     Ok(insert)
@@ -411,6 +420,7 @@ impl DatabaseReplayGenerator {
                         pk_column_indices: None,
                         rowid_alias_pk_column_index: None,
                         column_names: Vec::new(),
+                        updates_column_indices: Vec::new(),
                         is_ddl_replay: true,
                     };
                     Ok(update)
@@ -456,15 +466,14 @@ impl DatabaseReplayGenerator {
     ) -> Result<ReplayInfo> {
         let (column_names, pk_column_indices, rowid_alias_pk_column_index) =
             self.table_columns_info(coro, table_name).await?;
+        let updates_column_indices = self
+            .updates_column_indices(coro, table_name, columns.len())
+            .await?;
         // The CDC record may have fewer columns than the current schema
         // (e.g. records captured before ALTER TABLE ADD COLUMN).
         // Only reference columns present in the record.
-        let record_len = columns.len();
-        let record_columns = if record_len < column_names.len() {
-            &column_names[..record_len]
-        } else {
-            &column_names[..]
-        };
+        let stored_columns_in_record = updates_column_indices.iter().flatten().count();
+        let record_columns = &column_names[..stored_columns_in_record];
         let mut pk_predicates = Vec::with_capacity(1);
         let mut column_updates = Vec::with_capacity(1);
         for &idx in &pk_column_indices {
@@ -476,9 +485,15 @@ impl DatabaseReplayGenerator {
             }
             pk_predicates.push(identity_predicate(&record_columns[idx]));
         }
-        for (idx, name) in record_columns.iter().enumerate() {
-            if columns[idx] {
-                column_updates.push(format!("{} = ?", quote_ident(name)));
+        for (&changed, column_index) in columns.iter().zip(&updates_column_indices) {
+            let Some(column_index) = column_index else {
+                continue;
+            };
+            if changed {
+                column_updates.push(format!(
+                    "{} = ?",
+                    quote_ident(&record_columns[*column_index])
+                ));
             }
         }
         let quoted_table_name = quote_ident(table_name);
@@ -506,6 +521,7 @@ impl DatabaseReplayGenerator {
             change_type: DatabaseChangeType::Update,
             query,
             column_names: record_columns.to_vec(),
+            updates_column_indices,
             pk_column_indices,
             rowid_alias_pk_column_index,
             is_ddl_replay: false,
@@ -568,6 +584,7 @@ impl DatabaseReplayGenerator {
                 pk_column_indices: (!pk_column_indices.is_empty()).then_some(pk_column_indices),
                 rowid_alias_pk_column_index,
                 column_names: record_columns.to_vec(),
+                updates_column_indices: Vec::new(),
                 is_ddl_replay: false,
             });
         };
@@ -597,6 +614,7 @@ impl DatabaseReplayGenerator {
             change_type: DatabaseChangeType::Insert,
             query,
             column_names: original_column_names,
+            updates_column_indices: Vec::new(),
             pk_column_indices: None,
             rowid_alias_pk_column_index: None,
             is_ddl_replay: false,
@@ -640,6 +658,7 @@ impl DatabaseReplayGenerator {
                 change_type: DatabaseChangeType::Delete,
                 query,
                 column_names,
+                updates_column_indices: Vec::new(),
                 pk_column_indices: None,
                 rowid_alias_pk_column_index: None,
                 is_ddl_replay: false,
@@ -653,6 +672,7 @@ impl DatabaseReplayGenerator {
             change_type: DatabaseChangeType::Delete,
             query,
             column_names,
+            updates_column_indices: Vec::new(),
             pk_column_indices: Some(pk_column_indices),
             rowid_alias_pk_column_index,
             is_ddl_replay: false,
@@ -887,6 +907,37 @@ impl DatabaseReplayGenerator {
         };
         Ok((column_names, pk_column_indices, rowid_alias_pk_column_index))
     }
+
+    async fn updates_column_indices<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+        table_name: &str,
+        record_len: usize,
+    ) -> Result<Vec<Option<usize>>> {
+        let table_name_literal = sql_string_literal(table_name);
+        let mut table_xinfo_stmt = self.conn.prepare(format!(
+            "SELECT hidden FROM pragma_table_xinfo({table_name_literal})"
+        ))?;
+        let mut column_indices = Vec::new();
+        let mut stored_columns = 0;
+        while let Some(column) = run_stmt_once(coro, &mut table_xinfo_stmt).await? {
+            let turso_core::Value::Numeric(turso_core::Numeric::Integer(hidden)) =
+                column.get_value(0)
+            else {
+                return Err(Error::DatabaseTapeError(
+                    "unexpected column type for pragma_table_xinfo query".to_string(),
+                ));
+            };
+            if *hidden == 0 {
+                column_indices.push(Some(stored_columns));
+                stored_columns += 1;
+            } else {
+                column_indices.push(None);
+            }
+        }
+        column_indices.truncate(record_len);
+        Ok(column_indices)
+    }
 }
 
 fn generated_column_changed(
@@ -945,12 +996,10 @@ mod tests {
     ) -> Result<ReplayInfo> {
         let temp_file = NamedTempFile::new().unwrap();
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = turso_core::Database::open_file(
-            io.clone(),
-            temp_file.path().to_str().unwrap(),
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
+        let opts = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(turso_core::DatabaseOpts::new().with_generated_columns(true));
+        let db = turso_core::Database::open(io.clone(), temp_file.path().to_str().unwrap(), opts)
+            .unwrap();
         let conn = db.connect().unwrap();
         for stmt in ddl {
             conn.execute(stmt).unwrap();
@@ -1155,5 +1204,102 @@ mod tests {
         .unwrap();
         assert!(!generator
             .upsert_needs_null_safe_predelete(&rowid_alias, &[turso_core::Value::Null, text("v")]));
+    }
+
+    #[test]
+    fn test_update_replay_ignores_virtual_columns_of_updates_record() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(
+            io,
+            temp_file.path().to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let generator = DatabaseReplayGenerator::new(
+            db.connect().unwrap(),
+            DatabaseReplaySessionOpts {
+                use_implicit_rowid: false,
+            },
+        );
+        let int = turso_core::Value::from_i64;
+        let null = || turso_core::Value::Null;
+        let ddl = &["CREATE TABLE t (id INTEGER PRIMARY KEY, a, v AS (a + 1), b)"];
+        let update = |id: i64, before, after, updates| DatabaseTapeRowChange {
+            change_id: 0,
+            change_time: 0,
+            change: DatabaseTapeRowChangeType::Update {
+                before,
+                after,
+                updates: Some(updates),
+            },
+            table_name: "t".to_string(),
+            id,
+        };
+
+        let set_b = replay_info_for(
+            ddl,
+            "t",
+            QueryKind::Update(vec![false, false, false, true]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(set_b.query, r#"UPDATE "t" SET "b" = ? WHERE "id" IS ?"#);
+        let change = update(
+            1,
+            turso_core::alloc::vec![int(1), int(10), int(20)],
+            turso_core::alloc::vec![int(1), int(10), int(30)],
+            turso_core::alloc::vec![
+                int(0),
+                int(0),
+                int(0),
+                int(1),
+                null(),
+                null(),
+                null(),
+                int(30)
+            ],
+        );
+        let mutation = generator.create_mutation(&set_b, &change).unwrap();
+        assert_eq!(
+            mutation.updates,
+            Some(HashMap::from([("b".to_string(), int(30))]))
+        );
+
+        let set_a = replay_info_for(
+            ddl,
+            "t",
+            QueryKind::Update(vec![false, true, true, false]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(set_a.query, r#"UPDATE "t" SET "a" = ? WHERE "id" IS ?"#);
+        let before = turso_core::alloc::vec![int(2), int(40), int(50)];
+        let after = turso_core::alloc::vec![int(2), int(41), int(50)];
+        let updates = turso_core::alloc::vec![
+            int(0),
+            int(1),
+            int(1),
+            int(0),
+            null(),
+            int(41),
+            int(42),
+            null()
+        ];
+        let change = update(2, before.clone(), after.clone(), updates.clone());
+        let mutation = generator.create_mutation(&set_a, &change).unwrap();
+        assert_eq!(
+            mutation.updates,
+            Some(HashMap::from([("a".to_string(), int(41))]))
+        );
+        let values = generator.replay_values(
+            &set_a,
+            DatabaseChangeType::Update,
+            2,
+            after,
+            Some(updates),
+            Some(before),
+        );
+        assert_eq!(values.to_vec(), vec![int(41), int(2)]);
     }
 }
